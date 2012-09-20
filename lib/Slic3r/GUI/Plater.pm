@@ -5,6 +5,7 @@ use utf8;
 
 use File::Basename qw(basename dirname);
 use List::Util qw(max sum);
+use Math::ConvexHull qw(convex_hull);
 use Slic3r::Geometry qw(X Y Z X1 Y1 X2 Y2);
 use Slic3r::Geometry::Clipper qw(JT_ROUND);
 use threads::shared qw(shared_clone);
@@ -39,6 +40,8 @@ sub new {
     $self->{config} = Slic3r::Config->new_from_defaults(qw(
         bed_size print_center complete_objects extruder_clearance_radius skirts skirt_distance
     ));
+    $self->{objects} = [];
+    $self->{selected_objects} = [];
     
     $self->{canvas} = Wx::Panel->new($self, -1, wxDefaultPosition, CANVAS_SIZE, wxTAB_TRAVERSAL);
     $self->{canvas}->SetBackgroundColour(Wx::wxWHITE);
@@ -183,8 +186,6 @@ sub new {
     });
     
     $self->_update_bed_size;
-    $self->{objects} = [];
-    $self->{selected_objects} = [];
     $self->recenter;
     
     {
@@ -821,7 +822,6 @@ sub repaint {
 sub mouse_event {
     my ($self, $event) = @_;
     my $parent = $self->GetParent;
-    my $print = $parent->{print};
     
     my $point = $event->GetPosition;
     my $pos = $parent->_y([[$point->x, $point->y]])->[0]; #]]
@@ -830,12 +830,13 @@ sub mouse_event {
         $parent->{list}->Select($parent->{list}->GetFirstSelected, 0);
         $parent->selection_changed(0);
         for my $preview (@{$parent->{object_previews}}) {
-            if ($preview->[2]->encloses_point($pos)) {
-                $parent->{selected_objects} = [$preview];
-                $parent->{list}->Select($preview->[0], 1);
+            my ($obj_idx, $instance_idx, $thumbnail) = @$preview;
+            if ($thumbnail->encloses_point($pos)) {
+                $parent->{selected_objects} = [ [$obj_idx, $instance_idx] ];
+                $parent->{list}->Select($obj_idx, 1);
                 $parent->selection_changed(1);
-                my $copy = $print->copies->[ $preview->[0] ]->[ $preview->[1] ];
-                $self->{drag_start_pos} = [ map $pos->[$_] - $parent->{shift}[$_] - $parent->to_pixel($copy->[$_]), X,Y ];   # displacement between the click and the copy's origin
+                my $instance = $parent->{objects}[$obj_idx]->instances->[$instance_idx];
+                $self->{drag_start_pos} = [ map $pos->[$_] - $parent->{shift}[$_] - $parent->to_pixel($instance->[$_]), X,Y ];   # displacement between the click and the instance origin
                 $self->{drag_object} = $preview;
             }
         }
@@ -848,9 +849,10 @@ sub mouse_event {
         $self->SetCursor(wxSTANDARD_CURSOR);
     } elsif ($event->Dragging) {
         return if !$self->{drag_start_pos}; # concurrency problems
-        for my $obj ($self->{drag_object}) {
-            my $copy = $print->copies->[ $obj->[0] ]->[ $obj->[1] ];
-            $copy->[$_] = $parent->to_scaled($pos->[$_] - $self->{drag_start_pos}[$_] - $parent->{shift}[$_]) for X,Y;
+        for my $preview ($self->{drag_object}) {
+            my ($obj_idx, $instance_idx, $thumbnail) = @$preview;
+            my $instance = $parent->{objects}[$obj_idx]->instances->[$instance_idx];
+            $instance->[$_] = $parent->to_scaled($pos->[$_] - $self->{drag_start_pos}[$_] - $parent->{shift}[$_]) for X,Y;
             $parent->Refresh;
         }
     } elsif ($event->Moving) {
@@ -887,7 +889,7 @@ sub list_item_selected {
 sub object_list_changed {
     my $self = shift;
     
-    my $method = $self->{print} && @{$self->{print}->objects} ? 'Enable' : 'Disable';
+    my $method = @{$self->{objects}} ? 'Enable' : 'Disable';
     $self->{"btn_$_"}->$method
         for grep $self->{"btn_$_"}, qw(reset arrange export_gcode export_stl);
 }
